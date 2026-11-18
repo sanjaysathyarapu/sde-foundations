@@ -27,7 +27,7 @@ The ordered topic list and progress live in [ROADMAP.md](ROADMAP.md). The entry 
 
 | # | Date | Entry | Track |
 |---|---|---|---|
-| — | — | *First entry coming soon* | — |
+| 001 | 2026-11-18 | [What a backend is: the request → response lifecycle end to end](01-backend-first-principles/001-request-response-lifecycle/) | BE |
 
 ## Running the code
 
