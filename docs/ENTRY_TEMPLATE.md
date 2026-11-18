@@ -26,8 +26,8 @@ The mechanism, built up step by step from the most basic parts.
 ## 3. Diagram
 Mermaid sequence, flow, state or architecture diagram, wherever there's a flow or a structure to show.
 
-## 4. Code
-A small runnable Java example. Inline comments explain the *why*, not only the *what*.
+## 4. Code (optional)
+A small runnable Java example: at most ~60 lines in 1–2 files, plus one test class. Skip this section when prose and a diagram explain the concept better. Inline comments explain the *why*, not only the *what*.
 Link to the source file and its test.
 
 ### Self-check

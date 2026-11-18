@@ -10,7 +10,7 @@ The order runs from easy to deep. Each row is one entry, about a 15–20 minute 
 
 | # | Topic | Track | Status |
 |---|---|---|---|
-| 001 | What a backend is: the request → response lifecycle end to end | BE | in-review |
+| 001 | What a backend is: the request → response lifecycle end to end | BE | done |
 | 002 | HTTP fundamentals: messages, statelessness, HTTP/1.1 vs HTTP/2 | BE | planned |
 | 003 | HTTP methods and semantics: safe, idempotent, cacheable | BE | planned |
 | 004 | HTTP status codes: choosing the right one | BE | planned |
