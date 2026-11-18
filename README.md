@@ -37,3 +37,7 @@ cd code
 ```
 
 Requires JDK 21.
+
+## License
+
+Code under [`code/`](code/) is MIT-licensed ([LICENSE](LICENSE)). Written content is licensed under [CC BY 4.0](LICENSE-CONTENT).
