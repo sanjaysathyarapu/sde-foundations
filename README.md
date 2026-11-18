@@ -27,6 +27,7 @@ The ordered topic list and progress live in [ROADMAP.md](ROADMAP.md). The entry 
 
 | # | Date | Entry | Track |
 |---|---|---|---|
+| 002 | 2026-11-18 | [HTTP fundamentals: messages, statelessness, HTTP/1.1 vs HTTP/2](01-backend-first-principles/002-http-fundamentals/) | BE |
 | 001 | 2026-11-18 | [What a backend is: the request → response lifecycle end to end](01-backend-first-principles/001-request-response-lifecycle/) | BE |
 
 ## Running the code
