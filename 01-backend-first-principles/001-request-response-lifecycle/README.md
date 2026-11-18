@@ -5,48 +5,38 @@
 
 ## 1. The problem
 
-A user clicks "Place order". A second later they see "Order #7 confirmed". Between those two moments, at least five independent systems cooperated: a DNS resolver, the operating system's TCP stack on both machines, a TLS implementation, usually a load balancer, and the application process, which itself talks to a database.
+A user clicks "Place order" and a second later sees "Order #7 confirmed". In between, a DNS resolver, the TCP stacks on both machines, a TLS implementation, usually a load balancer, the application process and its database all cooperated.
 
-When that click fails, the error message rarely names the step that failed. "It's slow" might be DNS, the TLS handshake, a full accept queue, a slow SQL query, or a 2 MB JSON response. "It returned 400" might be the proxy rejecting a header before the application ever ran. "It hung" might be a server with no read timeout, waiting for bytes that will never arrive.
+When that click fails, the error rarely names the failing step. "It's slow" might be DNS, the TLS handshake, a full accept queue or a slow query. "It returned 400" might be the proxy rejecting a header before the application ran. "It hung" might be a server with no read timeout.
 
-You can't debug, scale or secure a backend without a precise model of where a request is at every moment of its life. This entry builds that model from the bottom up, then implements the server side in about 300 lines of Java so that no step is hidden inside a framework.
+You can't debug, scale or secure a backend without a precise model of where a request is at every moment. This entry builds that model, then implements the server side in one small Java file so no step is hidden inside a framework.
 
 ## 2. From first principles
 
 ### 2.1 What "backend" means
 
-A **backend** is a long-running process that:
+A **backend** is a long-running process that owns a **listening socket**, accepts **connections**, reads **requests** in an agreed protocol (almost always HTTP), maps each one to **application logic** that usually reads or writes shared state such as a database, and writes a **response** back on the same connection.
 
-1. owns a **listening socket** on some port,
-2. accepts **connections** from clients,
-3. reads **requests** from those connections, in a protocol both sides agree on (almost always HTTP),
-4. maps each request to **application logic**, which usually reads or writes shared state such as a database,
-5. writes a **response** back on the same connection.
+Two properties follow:
 
-Two properties follow from this shape:
-
-- **It serves many clients at once.** A browser renders for one user. A backend handles requests from all users concurrently, so concurrency, shared state and resource limits are central concerns, not edge cases.
-- **It is the trust boundary.** The client is code running on someone else's machine. Anything it sends can be forged, so validation, authentication and authorization have to happen on the server.
+- **It serves many clients at once**, so concurrency, shared state and resource limits are central concerns.
+- **It is the trust boundary.** Anything the client sends can be forged, so validation, authentication and authorization happen on the server.
 
 ### 2.2 Before the first byte of HTTP: name, connection, encryption
 
-Take `https://shop.example/orders` and follow it.
+Take `https://shop.example/orders`.
 
-**Step 1: name resolution (DNS).** The client has a hostname, but IP packets need an address. The OS stub resolver asks a recursive resolver, which walks the DNS hierarchy (root → `example` TLD servers → the zone's authoritative servers) and returns `A` (IPv4) or `AAAA` (IPv6) records (RFC 1034, RFC 1035). Answers carry a TTL and are cached at several layers, so most lookups never leave the machine or the local network. This is also why a DNS change "takes time to propagate": old answers live until their TTL expires.
+**DNS.** A recursive resolver walks the hierarchy (root → TLD → the zone's authoritative servers) and returns `A` or `AAAA` records (RFC 1034, RFC 1035). Answers carry a TTL and are cached at several layers, which is why DNS changes "take time to propagate".
 
-**Step 2: a TCP connection.** The client opens a TCP connection to `IP:443`. TCP establishes it with a three-way handshake: the client sends SYN, the server replies SYN-ACK, the client sends ACK (RFC 9293 §3.5). That costs one round trip before any application data moves. What TCP gives you afterwards is a reliable, ordered, bidirectional **byte stream**. It does not give you messages. If the client writes 500 bytes, the server may receive them in one `read()` or in five. Any message boundaries have to be added by the protocol on top.
+**TCP.** The client connects to `IP:443` with a three-way handshake, SYN → SYN-ACK → ACK (RFC 9293 §3.5): one round trip. The result is a reliable, ordered **byte stream**, not a sequence of messages: 500 bytes written may arrive in one `read()` or in five. Boundaries must come from the protocol on top. The kernel does the handshake: after `bind()` and `listen()` it queues finished connections in a **backlog**, and `accept()` takes the next one. If the application accepts too slowly, the queue fills and connections fail before your code runs.
 
-On the server, the kernel does the handshake, not your code. Once the process has called `bind()` and `listen()`, the kernel completes handshakes on its own and queues finished connections in a **backlog**. The application's `accept()` call takes the next already-established connection off that queue. If the application accepts slower than connections arrive, the queue fills and new connection attempts start failing or timing out before any of your code runs.
+**TLS.** A TLS 1.3 handshake (one round trip, RFC 8446 §2) checks the server's certificate against the hostname and agrees on keys. TLS is often **terminated** at a load balancer that forwards plain HTTP, so the application sees the proxy as its peer. That's why proxies add `Forwarded` (RFC 7239) or `X-Forwarded-For`, which may be trusted only from your own proxy.
 
-**Step 3: TLS.** For `https`, the client and server run a TLS handshake over the TCP connection. In TLS 1.3 a full handshake takes one round trip (RFC 8446 §2). It authenticates the server with its certificate, which must match the hostname, and agrees on keys. From then on, everything HTTP sends is encrypted and integrity-protected. The certificate check is what stops a machine in the middle from impersonating the server.
-
-TLS is often **terminated** before the application: a load balancer or reverse proxy holds the certificate, decrypts, and forwards plain HTTP (or re-encrypted HTTP) to the application servers behind it. In that setup, the application sees the proxy's IP address as the peer, not the user's. That is why proxies add headers such as `Forwarded` (RFC 7239) or the de facto `X-Forwarded-For`, and why an application must trust those headers only when they come from its own proxy.
-
-So before the server reads one byte of HTTP, the client has spent roughly one round trip on TCP and one on TLS 1.3, plus a DNS lookup if the answer wasn't cached. Keeping connections open and reusing them avoids paying these costs on every request. HTTP/1.1 connections are persistent by default for this reason (RFC 9112 §9.3).
+A new HTTPS connection therefore costs a DNS lookup (if not cached) plus about two round trips before the request is sent. HTTP/1.1 connections are persistent by default to avoid paying that again (RFC 9112 §9.3).
 
 ### 2.3 The request on the wire
 
-HTTP/1.1 turns the byte stream back into messages. A request is (RFC 9112 §2.1):
+HTTP/1.1 turns the byte stream back into messages (RFC 9112 §2.1):
 
 ```
 POST /orders HTTP/1.1\r\n                   ← request line: method, target, version
@@ -57,15 +47,11 @@ Content-Length: 27\r\n
 {"sku":"A-100","quantity":2}                 ← body: exactly Content-Length bytes
 ```
 
-Three framing rules do all the work:
+Three framing rules do all the work: **lines end in CRLF**; **an empty line ends the head**; and **the body length is declared up front**, by `Content-Length` or by `Transfer-Encoding: chunked` (RFC 9112 §6). With neither, a request has no body.
 
-- **Lines end in CRLF.** The head is a sequence of lines.
-- **An empty line ends the head.** Everything before it is metadata. Everything after it is body.
-- **The body length is declared up front**, by `Content-Length` or by `Transfer-Encoding: chunked`, which sends the body in length-prefixed pieces (RFC 9112 §6). Without one of those, a request has no body.
+`Host` is mandatory in HTTP/1.1; without it the answer is 400 (RFC 9112 §3.2). The connection says *which machine*; `Host` says *which site*.
 
-`Host` is mandatory in HTTP/1.1. A server must answer 400 to an HTTP/1.1 request without it (RFC 9112 §3.2). It exists so that one IP address can serve many hostnames: the TCP connection says *which machine*, `Host` says *which site*.
-
-The response has the same structure with a status line in place of the request line:
+The response has the same shape, with a status line first:
 
 ```
 HTTP/1.1 201 Created\r\n
@@ -75,24 +61,24 @@ Content-Length: 25\r\n
 {"id":7,"status":"placed"}
 ```
 
-The **meaning** of methods, status codes and headers is defined separately from this wire format, in RFC 9110 (HTTP Semantics). HTTP/2 (RFC 9113) and HTTP/3 (RFC 9114) replace the text framing with binary frames and multiplex many requests on one connection, but a request still has a method, a target, header fields and a body, with the same meanings. The lifecycle in this entry applies to all three versions. Entry 002 covers the differences.
+What methods, status codes and headers *mean* is defined separately, in RFC 9110. HTTP/2 (RFC 9113) and HTTP/3 (RFC 9114) use binary framing instead, but the lifecycle here applies to all three. Entry 002 covers the differences.
 
 ### 2.4 Inside the server: from bytes to a handler and back
 
-Once the connection is accepted and decrypted, every backend does the same sequence, whether it's hand-written, Spring Boot on Tomcat, Node.js, or a Next.js route handler:
+Once the connection is accepted and decrypted, every backend runs the same sequence, whether hand-written, Spring Boot on Tomcat, Node.js or a Next.js route handler:
 
-1. **Read and parse.** Read bytes until the empty line, parse the request line and headers, then read exactly as many body bytes as the framing says. Reject anything malformed with a 4xx *before* application code sees it.
-2. **Cross-cutting steps (middleware).** Logging, request IDs, authentication, rate limiting, compression. These apply to many routes, so they wrap the handlers instead of living in them. (Entry 013.)
-3. **Route.** Choose a handler from the method and path. No path match means 404. A path match with the wrong method means 405, which must include an `Allow` header listing the valid methods (RFC 9110 §15.5.6).
-4. **Deserialize and validate.** Turn the body into a typed object, then check it against business rules. Bad input is the client's fault: 400 or 422, not 500. (Entries 007–008.)
-5. **Business logic and I/O.** Usually most of the time is spent here: database queries, calls to other services, a model API.
-6. **Serialize and write.** Turn the result into a status code, headers and body bytes, and write them to the socket.
-7. **Finish the connection.** Either keep it open for the next request, or close it.
+1. **Read and parse** the head, then exactly as many body bytes as the framing says. Reject malformed input with a 4xx before application code sees it.
+2. **Middleware:** logging, request IDs, authentication, rate limiting. (Entry 013.)
+3. **Route** by method and path. No path match is 404; the wrong method is 405 with an `Allow` header (RFC 9110 §15.5.6).
+4. **Deserialize and validate.** Bad input is a 400 or 422, not a 500. (Entries 007–008.)
+5. **Business logic and I/O:** database queries, calls to other services. Usually most of the time.
+6. **Serialize and write** a status, headers and body.
+7. **Finish the connection:** keep it for the next request, or close it.
 
-Two properties of this pipeline matter for everything later in the journal:
+Two properties matter for everything later:
 
-- **Each request is handled independently.** Nothing about request *N* is available to request *N+1* unless it's stored somewhere both can reach: a database, a cache, or a token the client sends back. This is HTTP's statelessness (RFC 9110 §3.3), and it's why you can add more server instances behind a load balancer. (Entry 002.)
-- **Concurrency comes from handling connections in parallel.** A server either gives each connection its own thread (Tomcat's classic model, and this entry's code using Java 21 virtual threads) or multiplexes many connections on a few threads with an event loop (Node.js, Netty). Either way, the slow part, waiting on I/O, must not block other users' requests. (Entry 026.)
+- **Each request is handled independently.** Request *N+1* sees nothing from request *N* unless it's stored where both can reach it: a database, a cache, or a token the client sends back. This is HTTP's statelessness (RFC 9110 §3.3), and it's what lets you add instances behind a load balancer. (Entry 002.)
+- **Concurrency comes from handling connections in parallel**, with a thread per connection (classic Tomcat, and this entry's code using Java 21 virtual threads) or an event loop (Node.js, Netty). Either way, waiting on I/O must not block other users. (Entry 026.)
 
 ### Self-check
 
@@ -103,9 +89,9 @@ Two properties of this pipeline matter for everything later in the journal:
 <details>
 <summary>Answers</summary>
 
-- A DNS lookup (if the answer wasn't cached) and connection setup: the TCP handshake plus the TLS handshake. Later requests on a reused, persistent connection skip all of them. Application-level warm-up, such as JIT compilation, lazy initialization or a cold connection pool, can also make only the first request slow.
-- DNS (wrong or stale address), TCP connect (port closed, accept backlog full, firewall), TLS (certificate mismatch or expiry), the load balancer or proxy (no healthy upstream, request rejected for size or headers), or the server's own HTTP parser rejecting malformed bytes before invoking a handler.
-- TCP is a byte stream with no message boundaries. A request may arrive split across several reads, and with persistent connections, one read may contain the end of one request and the start of the next. Only HTTP's own framing (the empty line, then `Content-Length` or chunking) says where a message ends.
+- An uncached DNS lookup, and connection setup (TCP plus TLS handshakes). Later requests on the reused connection skip both. Application warm-up (JIT, lazy initialization, a cold connection pool) can also hit only the first request.
+- DNS (stale address), TCP connect (port closed, backlog full, firewall), TLS (certificate mismatch or expiry), the load balancer or proxy (no healthy upstream, size or header limits), or the server's HTTP parser rejecting malformed bytes.
+- TCP has no message boundaries. A request may arrive across several reads, and on a persistent connection one read may hold the end of one request and the start of the next. Only HTTP's framing (the empty line, then `Content-Length` or chunking) says where a message ends.
 
 </details>
 
@@ -139,7 +125,7 @@ sequenceDiagram
     LB-->>C: 201 Created (encrypted)
 ```
 
-What happens inside the app server between steps 9 and 12 above, as a pipeline. Every arrow out to the right is an early exit that never reaches the handler:
+What happens inside the app server between steps 9 and 12, as a pipeline. Every arrow out to the right is an early exit that never reaches the handler:
 
 ```mermaid
 flowchart LR
@@ -163,130 +149,97 @@ flowchart LR
 
 ## 4. Code
 
-The example is an HTTP/1.1 server on raw `java.net` sockets. It's small enough to read in one sitting and covers steps 1, 3, 6 and 7 of §2.4: accept, parse, route, handle, serialize, write. It skips TLS, persistent connections and chunked bodies.
-
-| File | Lifecycle step |
-|---|---|
-| [`MiniHttpServer.java`](../../code/src/main/java/foundations/e001_request_lifecycle/MiniHttpServer.java) | listen, accept, one virtual thread per connection, timeouts, error → status mapping, write |
-| [`RequestParser.java`](../../code/src/main/java/foundations/e001_request_lifecycle/RequestParser.java) | bytes → `HttpRequest`, enforcing RFC 9112 framing rules |
-| [`Router.java`](../../code/src/main/java/foundations/e001_request_lifecycle/Router.java) | method + path → handler, 404 vs 405 |
-| [`HttpResponse.java`](../../code/src/main/java/foundations/e001_request_lifecycle/HttpResponse.java) | `HttpResponse` → bytes |
-| [`LifecycleDemo.java`](../../code/src/main/java/foundations/e001_request_lifecycle/LifecycleDemo.java) | the "application": two routes |
-
-Tests: [`RequestParserTest.java`](../../code/src/test/java/foundations/e001_request_lifecycle/RequestParserTest.java) checks the parser against hand-written wire bytes. [`MiniHttpServerTest.java`](../../code/src/test/java/foundations/e001_request_lifecycle/MiniHttpServerTest.java) starts the server on an OS-chosen port and talks to it over real TCP, both with the JDK `HttpClient` and with raw bytes.
+[`MiniHttpServer.java`](../../code/src/main/java/foundations/e001_request_lifecycle/MiniHttpServer.java) is an HTTP/1.1 server on raw sockets covering steps 1, 3, 6 and 7 of §2.4, without TLS, keep-alive or chunked bodies. [`MiniHttpServerTest.java`](../../code/src/test/java/foundations/e001_request_lifecycle/MiniHttpServerTest.java) exchanges raw bytes with it over real TCP, so the wire format is visible in every assertion.
 
 The connection handler is the whole lifecycle in one method:
 
 ```java
 private void handle(Socket client) {
     try (client) {
-        // Without a timeout, a client that connects and never sends a byte would hold this
-        // connection open forever. That is the idea behind slow-client (Slowloris) attacks.
-        client.setSoTimeout(READ_TIMEOUT_MILLIS);
-        InputStream in = new BufferedInputStream(client.getInputStream());
-        OutputStream out = client.getOutputStream();
-
-        HttpResponse response;
-        try {
-            HttpRequest request = RequestParser.parse(in);   // bytes -> meaning
-            response = handler.apply(request);                // route + application logic
-        } catch (RequestParser.BadRequestException e) {
-            // A malformed request never reaches application code.
-            response = HttpResponse.text(e.status(), e.reason(), e.getMessage() + "\n");
-        } catch (RuntimeException e) {
-            // A handler bug becomes a 500 for this request only; details stay in the server log.
-            System.err.println("handler failed: " + e);
-            response = HttpResponse.text(500, "Internal Server Error", "internal error\n");
+        client.setSoTimeout(READ_TIMEOUT_MILLIS); // otherwise a client that sends nothing holds this socket forever
+        Response res;
+        try { // ISO-8859-1 maps each byte to one char, so char counts below equal byte counts
+            res = route(parse(new BufferedReader(new InputStreamReader(client.getInputStream(), ISO_8859_1))));
+        } catch (HttpError e) { // malformed input never reaches a handler
+            res = new Response(e.status, e.getMessage() + "\n", null);
+        } catch (RuntimeException bug) { // a handler bug: log the details, never send them to the client
+            System.err.println("handler failed: " + bug);
+            res = new Response(500, "internal error\n", null);
         }
-
-        out.write(response.toBytes());                        // meaning -> bytes
-        out.flush();
-    } catch (IOException e) {
-        // Timeout or client disconnect: nothing useful can be sent back.
-    }
+        // Content-Length tells the client where the body ends; "close": one request per connection.
+        String head = "HTTP/1.1 " + res.status() + " \r\n" + (res.allow() == null ? "" : "Allow: " + res.allow() + "\r\n")
+                + "Content-Length: " + res.body().length() + "\r\nConnection: close\r\n\r\n";
+        client.getOutputStream().write((head + res.body()).getBytes(ISO_8859_1));
+    } catch (IOException timeoutOrDisconnect) {} // nothing useful can be sent back
 }
 ```
 
-And the part of the parser that restores message boundaries on top of TCP's byte stream:
+The parser restores message boundaries on top of TCP's byte stream:
 
 ```java
-long length = Long.parseLong(contentLength);
-if (length > MAX_BODY_BYTES) {
-    throw new BadRequestException(413, "Content Too Large", "body of " + length + " bytes");
-}
-// readNBytes loops until it has the full count or hits end of stream. A single read()
-// may return fewer bytes, because TCP segments do not line up with HTTP messages.
-byte[] body = in.readNBytes((int) length);
+if (Integer.parseInt(declared) > MAX_BODY_BYTES) throw new HttpError(413, "body too large"); // before allocating
+char[] body = new char[Integer.parseInt(declared)];
+// TCP has no message boundaries: one read() may return part of the body, so loop until it is complete.
+for (int n = 0, r; n < body.length; n += r)
+    if ((r = in.read(body, n, body.length - n)) < 0) throw new HttpError(400, "body cut short");
 ```
 
-The parser rejects some inputs that a lenient parser might accept, such as two `Content-Length` headers, whitespace between a header name and its colon, or any `Transfer-Encoding`. That's deliberate. If a proxy and a server disagree about where a request ends, an attacker can hide a second request inside the first one's body. This is **HTTP request smuggling**, and RFC 9112 §11.2 calls out exactly this framing ambiguity as its cause. Refusing to guess is the safe default.
-
-Run it yourself:
-
-```bash
-cd code
-./gradlew test --tests 'foundations.e001_request_lifecycle.*'
-# or start the demo server and use curl -v to see the raw heads:
-./gradlew compileJava && java -cp build/classes/java/main foundations.e001_request_lifecycle.LifecycleDemo
-curl -v -X DELETE http://localhost:8080/hello
-```
+It also refuses any `Transfer-Encoding` (501) rather than guess at framing. When a proxy and a server disagree about where a request ends, an attacker can hide a second request in the first one's body: **request smuggling** (RFC 9112 §11.2). Production parsers also reject duplicate `Content-Length` values and whitespace before a header's colon (RFC 9112 §5.1). Run the tests with `cd code && ./gradlew test --tests 'foundations.e001_request_lifecycle.*'`.
 
 ### Self-check
 
 - What happens if you remove `client.setSoTimeout(...)` and a client opens 10,000 connections without sending anything?
-- `HttpResponse.toBytes()` always writes `Content-Length`. What would the client have to do to find the end of the body if it didn't, and what would that cost?
-- In `Router.apply`, why are routes keyed by path first and method second, instead of by a single `"GET /hello"` string?
+- `handle` always writes `Content-Length`. What would the client have to do to find the end of the body if it didn't, and what would that cost?
+- Why is `routes` keyed by path first and method second, instead of by a single `"GET /hello"` string?
 
 <details>
 <summary>Answers</summary>
 
-- Each connection's virtual thread blocks in `read()` forever, and each open socket holds a file descriptor and buffers. Virtual threads are cheap, but file descriptors and memory are not unlimited. Eventually the process hits its descriptor limit, `accept()` starts failing, and legitimate users can't connect. The timeout bounds how long an idle client can hold resources.
-- It would have to read until the server closes the connection, because close is the only remaining end-of-body signal for a response without `Content-Length` or chunked encoding (RFC 9112 §6.3). That rules out reusing the connection for another request, and the client can't tell a complete body from one cut off by a network failure.
-- Because "this path exists but not for this method" (405, with `Allow`) is a different answer from "this path doesn't exist" (404). With a single combined key, the router could only ever say 404.
+- Each virtual thread blocks in `read()` forever, and each socket holds a file descriptor and buffers. Virtual threads are cheap, descriptors are not unlimited: eventually `accept()` fails and real users can't connect. The timeout bounds how long an idle client holds resources; `silentClientIsDisconnectedAfterTheReadTimeout` checks it.
+- Read until the server closes the connection, the only remaining end-of-body signal (RFC 9112 §6.3). The connection can't be reused, and a complete body looks the same as one cut off by a network failure.
+- "This path exists, but not for this method" (405 with `Allow`) is a different answer from "no such path" (404). A combined key could only ever say 404.
 
 </details>
 
 ## 5. Trade-offs and failure modes
 
-**Where time goes.** On a new HTTPS connection, the client pays DNS (if not cached), one round trip for TCP and one for TLS 1.3 before the request is even sent. For a user far from the server, that setup alone can rival the handler's own time. The standard mitigations all attack setup cost: persistent connections and connection pools, HTTP/2 multiplexing (many requests, one connection), TLS session resumption, and terminating TLS close to users at a CDN or edge.
+**Setup cost.** A new HTTPS connection pays DNS plus a round trip each for TCP and TLS before the request leaves. The fixes all attack setup: connection reuse and pools, HTTP/2 multiplexing, TLS session resumption, terminating TLS near users at a CDN.
 
-**Where requests die without a log line.** Failures before the handler are invisible to application logs: DNS pointing at an old IP, a full accept backlog, an expired certificate, the proxy rejecting an oversized header, the HTTP parser rejecting framing. When "the API is down" but the app logs are clean, look at proxy and load-balancer logs, and at connection-level metrics.
+**Failures without a log line.** A stale DNS record, a full backlog, an expired certificate, a proxy limit or a parser rejection never reaches application logs. When app logs are clean but "the API is down", check proxy and load-balancer logs and connection metrics.
 
-**Limits are part of correctness.** Every unbounded read is a denial-of-service vector: line length, header count, body size, idle time. The example caps all four. Production servers expose them as configuration, and the right values depend on the API.
+**Limits are part of correctness.** Every unbounded read is a denial-of-service vector: idle time, body size, line length, header count. The example caps the first two; production servers cap all four.
 
-**Thread per connection vs event loop.** Thread-per-connection code is simple to write and debug because it's sequential. Platform threads are expensive (each reserves stack memory), which is why event loops became popular for high connection counts. Java 21 virtual threads (JEP 444) make the blocking style cheap again for I/O-bound work. They don't help with CPU-bound work, and they don't remove other limits such as database connection pools.
+**Thread per connection vs event loop.** Blocking code is easy to read, but platform threads are expensive, which is why event loops won at high connection counts. Virtual threads (JEP 444) make blocking cheap again for I/O-bound work, not for CPU-bound work, and they don't lift limits such as database pool size.
 
-**Errors must be classified at the boundary.** Malformed input is a 4xx. A bug or a dependency failure is a 5xx. Mixing these up breaks clients: a client may retry a 503 but should not blindly retry a 400. Leaking exception messages in a 500 hands internal details to attackers, so details go to logs and the client gets a generic message.
-
-**The client is not trusted.** Every byte from the client, including headers like `X-Forwarded-For`, can be forged. Validation, authentication and authorization belong on the server, after parsing and before business logic.
+**Classify errors at the boundary.** Malformed input is 4xx; a bug or failed dependency is 5xx. Clients may retry a 503 but not blindly a 400. Exception details go to logs, never into responses.
 
 ## 6. In the real world
 
-**Callwise.** Callwise runs on Next.js deployed to Vercel. The platform handles DNS, TLS and the HTTP server, so application code starts at the pipeline in §2.4 with an already-parsed Web `Request`:
+**Callwise** runs on Next.js on Vercel. The platform handles DNS, TLS and the HTTP server, so application code starts at §2.4 with an already-parsed `Request`:
 
-- [`src/proxy.ts`](https://github.com/sanjaysathyarapu/callwise/blob/main/src/proxy.ts) is middleware (Next.js 16 calls it "proxy"). It runs before matching pages and redirects signed-out users to `/login`, an early exit before any handler.
-- [`src/app/api/chat/route.ts`](https://github.com/sanjaysathyarapu/callwise/blob/main/src/app/api/chat/route.ts) is the handler for `POST /api/chat`. Its first lines follow the lifecycle order: rate-limit by client IP (429), parse and validate the JSON body with a zod schema (400 on failure), check message sizes, then do the I/O (database, vector retrieval, model call) and stream the response.
+- [`src/proxy.ts`](https://github.com/sanjaysathyarapu/callwise/blob/main/src/proxy.ts) is middleware (Next.js 16 calls it "proxy"): it redirects signed-out users to `/login` before any page handler runs.
+- [`src/app/api/chat/route.ts`](https://github.com/sanjaysathyarapu/callwise/blob/main/src/app/api/chat/route.ts) handles `POST /api/chat` in lifecycle order: rate-limit by client IP (429), validate the JSON body with zod (400), check message sizes, then do the I/O (database, retrieval, model call) and stream the response.
 
-**A typical Spring Boot service.** Embedded Tomcat owns the listening socket, accepts connections and parses HTTP. Servlet filters are the middleware layer (Spring Security is a chain of filters). `DispatcherServlet` is the router: its handler mappings choose a `@RestController` method from method and path. `HttpMessageConverter`s deserialize the body (Jackson for JSON) and serialize the return value. A `@ControllerAdvice` maps exceptions to status codes. Every class in this entry's example has a direct counterpart there.
+**Spring Boot.** Embedded Tomcat accepts and parses; servlet filters are the middleware (Spring Security is a filter chain); `DispatcherServlet` routes to a `@RestController`; `HttpMessageConverter`s (Jackson) convert bodies; `@ControllerAdvice` maps exceptions to status codes.
 
-**Load balancers and CDNs.** Managed load balancers and CDNs commonly terminate TLS, enforce header and body size limits, and add forwarding headers before the request reaches your process. Their limits and timeouts are part of your API's behavior, whether or not you configured them.
+**Load balancers and CDNs** terminate TLS, enforce size limits and add forwarding headers. Their limits and timeouts are part of your API's behavior whether or not you configured them.
 
 ## 7. Interview Q&A
 
 **Q:** What happens when you type a URL into a browser and press Enter? Focus on the backend side.
-**A:** The browser resolves the hostname through DNS, possibly from cache, to get an IP address. It opens a TCP connection with a three-way handshake and, for HTTPS, runs a TLS handshake that authenticates the server's certificate and agrees on keys. It then sends an HTTP request: method, target, headers including `Host`, and an optional body. Often a load balancer terminates TLS and forwards the request to one of several app servers. The server parses the request, runs middleware such as auth and logging, routes it to a handler, which validates input and talks to a database, then serializes a response with a status code, headers and body. The connection is usually kept open for reuse.
+**A:** The browser resolves the hostname through DNS, often from cache. It opens a TCP connection and, for HTTPS, runs a TLS handshake that authenticates the server and agrees on keys. It sends a request: method, target, headers including `Host`, optional body. A load balancer often terminates TLS and forwards to an app server, which parses the request, runs middleware such as auth and logging, routes to a handler that validates input and queries a database, and serializes a response. The connection is usually kept for reuse.
 
 **Q:** How does an HTTP/1.1 server know where one request ends and the next begins on the same connection?
-**A:** TCP provides only a byte stream, so HTTP/1.1 defines its own framing. The head ends at the first empty line (CRLF CRLF). The body length is given by `Content-Length`, or the body is sent with `Transfer-Encoding: chunked`, where each chunk is length-prefixed and a zero-length chunk ends it. With neither header, a request has no body. If two parties in a chain disagree on these rules, for example one honors `Content-Length` and the other `Transfer-Encoding`, you get request smuggling, so strict servers reject ambiguous framing.
+**A:** TCP is only a byte stream, so HTTP/1.1 frames messages itself. The head ends at the first empty line. The body length comes from `Content-Length`, or from `Transfer-Encoding: chunked`, where each chunk is length-prefixed and a zero-length chunk ends the body. With neither, there is no body. If two hops disagree on these rules you get request smuggling, so strict servers reject ambiguous framing.
 
 **Q:** Where can a request fail before it reaches your application code, and how would you tell?
-**A:** At DNS (wrong or stale record), at TCP connect (port closed, firewall, accept backlog full), at TLS (expired or mismatched certificate), at the load balancer or proxy (no healthy backend, size or header limits, timeouts), or in the server's HTTP parser (malformed request). None of these produce application log lines. You check the client-side error type (DNS error vs connection refused vs TLS error vs a proxy-generated 502/504) and the proxy and load-balancer logs and metrics.
+**A:** At DNS, TCP connect (port closed, firewall, full backlog), TLS (bad certificate), the load balancer or proxy (no healthy backend, limits, timeouts), or the HTTP parser. None produce application logs. The client's error type tells them apart (DNS error, connection refused, TLS error, a proxy's 502/504), and proxy logs and metrics confirm it.
 
 **Q:** Why should a handler bug return 500 with a generic body instead of the exception message?
-**A:** 5xx tells the client the server failed and the request itself may be fine, which drives correct retry and alerting behavior. The exception message and stack trace can expose internals such as SQL, file paths, library versions or data, which helps attackers. So the server logs the full detail with a request ID and returns a generic message, ideally including that ID so the two can be correlated.
+**A:** A 5xx tells the client the server failed, which drives correct retries and alerting. Exception messages and stack traces can expose SQL, paths, versions or data. Log the details with a request ID and return a generic message carrying that ID.
 
 **Q:** Why are backends designed so that each request can be handled independently?
-**A:** HTTP is stateless: each request carries everything needed to interpret it, and the server doesn't rely on memory of earlier requests on that connection. Shared state lives in a database, cache or a client-held token. That lets a load balancer send any request to any instance, which is what makes horizontal scaling, rolling deploys and instance failure tolerable.
+**A:** HTTP is stateless: each request carries everything needed to interpret it. Shared state lives in a database, cache or client-held token, so a load balancer can send any request to any instance. That is what makes horizontal scaling, rolling deploys and surviving instance failure possible.
 
 ## 8. References
 
@@ -298,6 +251,6 @@ curl -v -X DELETE http://localhost:8080/hello
 - RFC 1034 and RFC 1035, *Domain Names*: concepts and implementation. https://www.rfc-editor.org/rfc/rfc1034 · https://www.rfc-editor.org/rfc/rfc1035
 - RFC 7239, *Forwarded HTTP Extension*. https://www.rfc-editor.org/rfc/rfc7239
 - JEP 444, *Virtual Threads*. https://openjdk.org/jeps/444
-- Java SE 21 API: [`java.net.ServerSocket`](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/net/ServerSocket.html), [`java.net.http.HttpClient`](https://docs.oracle.com/en/java/javase/21/docs/api/java.net.http/java/net/http/HttpClient.html)
+- Java SE 21 API: [`java.net.ServerSocket`](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/net/ServerSocket.html)
 - Spring Framework reference, *DispatcherServlet*. https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-servlet.html
 - Next.js docs, *Route Handlers* and *Proxy*. https://nextjs.org/docs/app/api-reference/file-conventions/route · https://nextjs.org/docs/app/api-reference/file-conventions/proxy
