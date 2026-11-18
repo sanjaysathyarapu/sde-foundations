@@ -1,116 +1,86 @@
 package foundations.e001_request_lifecycle;
 
-import java.io.BufferedInputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.InetAddress;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.net.SocketException;
-import java.net.SocketTimeoutException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import static java.nio.charset.StandardCharsets.ISO_8859_1;
+
+import java.io.*;
+import java.net.*;
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.function.Function;
 
-/**
- * A deliberately small HTTP/1.1 server built directly on TCP sockets, so every stage of the
- * request lifecycle is visible in one file: accept, read, parse, route, handle, serialize, write.
- *
- * <p>Not for production: no TLS, no keep-alive, no chunked bodies. Its job is to show what a
- * framework such as Spring Boot (on Tomcat or Netty) does for you before your controller runs.
- */
+/** HTTP/1.1 on raw sockets: accept, parse, route, handle, write. No TLS, keep-alive or chunked bodies. */
 public final class MiniHttpServer implements AutoCloseable {
-
-    /** How long a connection may sit idle before we give up on it. */
-    private static final int READ_TIMEOUT_MILLIS = 5_000;
-
-    private final ServerSocket serverSocket;
-    private final Function<HttpRequest, HttpResponse> handler;
-    // One virtual thread per connection (Java 21). A blocking read parks the virtual thread
-    // instead of an OS thread, so thread-per-connection code stays simple without the old cost.
-    private final ExecutorService connections = Executors.newVirtualThreadPerTaskExecutor();
-    private final Thread acceptLoop;
-
-    private MiniHttpServer(ServerSocket serverSocket, Function<HttpRequest, HttpResponse> handler) {
-        this.serverSocket = serverSocket;
-        this.handler = handler;
-        this.acceptLoop = Thread.ofPlatform().name("accept-loop").daemon().start(this::acceptForever);
+    static final int READ_TIMEOUT_MILLIS = 5_000, MAX_BODY_BYTES = 1 << 20;
+    public record Request(String method, String path, Map<String, String> headers, String body) {}
+    public record Response(int status, String body, String allow) {}
+    static final class HttpError extends RuntimeException { // a 4xx/5xx decided before any handler runs
+        final int status;
+        HttpError(int status, String why) { super(why); this.status = status; }
     }
 
-    /**
-     * Binds to {@code port} on the loopback interface and starts accepting connections.
-     * Pass 0 to let the operating system choose a free port, which tests rely on.
-     */
-    public static MiniHttpServer start(int port, Function<HttpRequest, HttpResponse> handler)
-            throws IOException {
-        // bind() + listen(): from here the kernel completes TCP handshakes on our behalf and queues
-        // finished connections (the backlog, 50 here) until accept() takes them.
-        ServerSocket socket = new ServerSocket(port, 50, InetAddress.getLoopbackAddress());
-        return new MiniHttpServer(socket, handler);
+    // path -> method -> handler. Path first, so "no such path" (404) differs from "wrong method" (405).
+    private final Map<String, Map<String, Function<Request, Response>>> routes;
+    private final ExecutorService connections = Executors.newVirtualThreadPerTaskExecutor(); // cheap blocking threads
+    private final ServerSocket socket;
+
+    public MiniHttpServer(int port, Map<String, Map<String, Function<Request, Response>>> routes) throws IOException {
+        this.routes = Map.copyOf(routes);
+        socket = new ServerSocket(port, 50, InetAddress.getLoopbackAddress()); // bind + listen: kernel now accepts TCP
+        Thread.ofPlatform().daemon().start(() -> { // accept() returns connections the kernel already established
+            while (!socket.isClosed()) try { Socket c = socket.accept(); connections.submit(() -> handle(c)); } catch (IOException e) {}
+        });
     }
 
-    public int port() {
-        return serverSocket.getLocalPort();
-    }
-
-    private void acceptForever() {
-        while (!serverSocket.isClosed()) {
-            try {
-                // accept() returns an already-established TCP connection. The three-way handshake
-                // happened in the kernel; application code never sees SYN or ACK.
-                Socket client = serverSocket.accept();
-                connections.submit(() -> handle(client));
-            } catch (SocketException closed) {
-                return; // close() was called: the listening socket is gone, stop accepting
-            } catch (IOException e) {
-                // One failed accept must not take the whole server down.
-                System.err.println("accept failed: " + e.getMessage());
-            }
-        }
-    }
+    public int port() { return socket.getLocalPort(); }
 
     private void handle(Socket client) {
         try (client) {
-            // Without a timeout, a client that connects and never sends a byte would hold this
-            // connection open forever. That is the idea behind slow-client (Slowloris) attacks.
-            client.setSoTimeout(READ_TIMEOUT_MILLIS);
-            // Buffering matters: the parser reads one byte at a time, and each unbuffered read
-            // would be a separate system call.
-            InputStream in = new BufferedInputStream(client.getInputStream());
-            OutputStream out = client.getOutputStream();
-
-            HttpResponse response;
-            try {
-                HttpRequest request = RequestParser.parse(in);
-                response = handler.apply(request);
-            } catch (RequestParser.BadRequestException e) {
-                // A malformed request never reaches application code.
-                response = HttpResponse.text(e.status(), e.reason(), e.getMessage() + "\n");
-            } catch (RuntimeException e) {
-                // A bug in a handler becomes a 500 for this request only. The detail goes to the
-                // server log, not to the client, because stack traces leak internals.
-                System.err.println("handler failed: " + e);
-                response = HttpResponse.text(500, "Internal Server Error", "internal error\n");
+            client.setSoTimeout(READ_TIMEOUT_MILLIS); // otherwise a client that sends nothing holds this socket forever
+            Response res;
+            try { // ISO-8859-1 maps each byte to one char, so char counts below equal byte counts
+                res = route(parse(new BufferedReader(new InputStreamReader(client.getInputStream(), ISO_8859_1))));
+            } catch (HttpError e) { // malformed input never reaches a handler
+                res = new Response(e.status, e.getMessage() + "\n", null);
+            } catch (RuntimeException bug) { // a handler bug: log the details, never send them to the client
+                System.err.println("handler failed: " + bug);
+                res = new Response(500, "internal error\n", null);
             }
-
-            out.write(response.toBytes());
-            out.flush();
-        } catch (SocketTimeoutException e) {
-            // The client went quiet. Closing the socket (try-with-resources) frees the connection.
-        } catch (IOException e) {
-            // The client disconnected mid-exchange. Nothing useful can be sent back.
-        }
+            // Content-Length tells the client where the body ends; "close": one request per connection.
+            String head = "HTTP/1.1 " + res.status() + " \r\n" + (res.allow() == null ? "" : "Allow: " + res.allow() + "\r\n")
+                    + "Content-Length: " + res.body().length() + "\r\nConnection: close\r\n\r\n";
+            client.getOutputStream().write((head + res.body()).getBytes(ISO_8859_1));
+        } catch (IOException timeoutOrDisconnect) {} // nothing useful can be sent back
     }
 
-    @Override
-    public void close() throws IOException {
-        serverSocket.close(); // unblocks accept() with a SocketException, ending the loop
-        connections.close(); // waits for in-flight connections to finish (Java 19+)
-        try {
-            acceptLoop.join(1_000);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+    static Request parse(BufferedReader in) throws IOException {
+        String[] line = String.valueOf(in.readLine()).split(" ", -1); // method SP target SP version
+        if (line.length != 3) throw new HttpError(400, "bad request line");
+        if (!line[2].equals("HTTP/1.1")) throw new HttpError(505, "only HTTP/1.1 is supported");
+        Map<String, String> headers = new HashMap<>();
+        for (String h; (h = in.readLine()) != null && !h.isEmpty(); ) { // an empty line ends the head
+            int colon = h.indexOf(':');
+            if (colon <= 0) throw new HttpError(400, "bad header line");
+            headers.put(h.substring(0, colon).toLowerCase(Locale.ROOT), h.substring(colon + 1).strip()); // names ignore case
         }
+        if (!headers.containsKey("host")) throw new HttpError(400, "missing Host");
+        if (headers.containsKey("transfer-encoding")) throw new HttpError(501, "chunked bodies not supported");
+        String declared = headers.getOrDefault("content-length", "0"); // no length header: no body
+        if (!declared.matches("\\d{1,9}")) throw new HttpError(400, "bad Content-Length");
+        if (Integer.parseInt(declared) > MAX_BODY_BYTES) throw new HttpError(413, "body too large"); // before allocating
+        char[] body = new char[Integer.parseInt(declared)];
+        // TCP has no message boundaries: one read() may return part of the body, so loop until it is complete.
+        for (int n = 0, r; n < body.length; n += r)
+            if ((r = in.read(body, n, body.length - n)) < 0) throw new HttpError(400, "body cut short");
+        return new Request(line[0], line[1].split("\\?", 2)[0], headers, new String(body));
     }
+
+    private Response route(Request req) {
+        var byMethod = routes.getOrDefault(req.path(), Map.of());
+        if (byMethod.isEmpty()) return new Response(404, "no route\n", null);
+        if (!byMethod.containsKey(req.method())) // a 405 MUST list the allowed methods in Allow (RFC 9110 §15.5.6)
+            return new Response(405, "method not allowed\n", String.join(", ", new TreeSet<>(byMethod.keySet())));
+        return byMethod.get(req.method()).apply(req);
+    }
+
+    @Override public void close() throws IOException { socket.close(); connections.close(); }
 }
