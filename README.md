@@ -27,6 +27,7 @@ The ordered topic list and progress live in [ROADMAP.md](ROADMAP.md). The entry 
 
 | # | Date | Entry | Track |
 |---|---|---|---|
+| 004 | 2026-11-20 | [HTTP status codes: choosing the right one](01-backend-first-principles/004-http-status-codes/) | BE |
 | 003 | 2026-11-19 | [HTTP methods and semantics: safe, idempotent, cacheable](01-backend-first-principles/003-http-methods/) | BE |
 | 002 | 2026-11-18 | [HTTP fundamentals: messages, statelessness, HTTP/1.1 vs HTTP/2](01-backend-first-principles/002-http-fundamentals/) | BE |
 | 001 | 2026-11-18 | [What a backend is: the request → response lifecycle end to end](01-backend-first-principles/001-request-response-lifecycle/) | BE |
