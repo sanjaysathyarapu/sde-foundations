@@ -14,7 +14,7 @@ The order runs from easy to deep. Each row is one entry, about a 15–20 minute 
 | 002 | HTTP fundamentals: messages, statelessness, HTTP/1.1 vs HTTP/2 | BE | done |
 | 003 | HTTP methods and semantics: safe, idempotent, cacheable | BE | done |
 | 004 | HTTP status codes: choosing the right one | BE | done |
-| 005 | HTTP headers and CORS: simple vs preflight requests | BE | planned |
+| 005 | HTTP headers and CORS: simple vs preflight requests | BE | in-review |
 | 006 | Routing: matching paths, params, versioning | BE | planned |
 | 007 | Serialization and deserialization: JSON, schemas, pitfalls | BE | planned |
 | 008 | Validation and transformation: where and why | BE | planned |
