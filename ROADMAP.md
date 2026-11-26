@@ -16,7 +16,7 @@ The order runs from easy to deep. Each row is one entry, about a 15–20 minute 
 | 004 | HTTP status codes: choosing the right one | BE | done |
 | 005 | HTTP headers and CORS: simple vs preflight requests | BE | done |
 | 006 | Routing: matching paths, params, versioning | BE | done |
-| 007 | Serialization and deserialization: JSON, schemas, pitfalls | BE | planned |
+| 007 | Serialization and deserialization: JSON, schemas, pitfalls | BE | done |
 | 008 | Validation and transformation: where and why | BE | planned |
 | 009 | Authentication: sessions vs tokens (JWT), cookies, storage | BE | planned |
 | 010 | Password storage: hashing, salting, slow hashes | BE | planned |
