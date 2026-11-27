@@ -27,6 +27,7 @@ The ordered topic list and progress live in [ROADMAP.md](ROADMAP.md). The entry 
 
 | # | Date | Entry | Track |
 |---|---|---|---|
+| 008 | 2026-11-27 | [Validation and transformation: where and why](01-backend-first-principles/008-validation/) | BE |
 | 007 | 2026-11-26 | [Serialization and deserialization: JSON, schemas, pitfalls](01-backend-first-principles/007-serialization/) | BE |
 | 006 | 2026-11-25 | [Routing: matching paths, params, versioning](01-backend-first-principles/006-routing/) | BE |
 | 005 | 2026-11-21 | [HTTP headers and CORS: simple vs preflight requests](01-backend-first-principles/005-http-headers-cors/) | BE |
